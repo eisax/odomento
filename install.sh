@@ -54,7 +54,7 @@ DEFAULT_ODOO_PORT="9017"
 DEFAULT_ODOO_LONGPOLL_PORT="8072"
 DEFAULT_POSTGRES_PORT="6792"
 DEFAULT_ODOO_VERSION="17.0"
-DEFAULT_PASSWORD="B@hou1983"
+DEFAULT_PASSWORD="Admin@#$1234"
 
 # Network interface (auto-detected)
 NETWORK_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
