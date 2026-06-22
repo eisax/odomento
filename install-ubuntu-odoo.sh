@@ -939,3 +939,4 @@ cat > /opt/backup/GUIDE-INSTALLATION-SystemERP.md << 'EOFDOC'
 ```bash
 sudo apt update
 sudo apt install -y nano wget curl
+EOFDOC
