@@ -75,16 +75,36 @@ read -p "Domain name (e.g., erp.mycompany.com) [$DEFAULT_DOMAIN_LOCAL]: " DOMAIN
 DOMAIN_LOCAL=${DOMAIN_LOCAL:-$DEFAULT_DOMAIN_LOCAL}
 echo ""
 
+# SSH Option
+echo ""
+echo "🔧 SSH CONFIGURATION OPTION:"
+read -p "Configure SSH port and hardening? (y/N): " CHANGE_SSH
+CHANGE_SSH=${CHANGE_SSH:-n}
+
+# Detect active SSH port to use for UFW configuration if SSH change is skipped
+DETECTED_SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1)
+DETECTED_SSH_PORT=${DETECTED_SSH_PORT:-22}
+
+if [[ $CHANGE_SSH =~ ^[Yy]$ ]]; then
+    read -p "SSH Port [$DEFAULT_SSH_PORT]: " SSH_PORT
+    SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
+else
+    SSH_PORT=$DETECTED_SSH_PORT
+fi
+
 # Port configuration
 echo "🔧 PORT CONFIGURATION:"
-read -p "SSH Port [$DEFAULT_SSH_PORT]: " SSH_PORT
-SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
-
 read -p "Odoo Port [$DEFAULT_ODOO_PORT]: " ODOO_PORT
 ODOO_PORT=${ODOO_PORT:-$DEFAULT_ODOO_PORT}
 
 read -p "PostgreSQL Port [$DEFAULT_POSTGRES_PORT]: " POSTGRES_PORT
 POSTGRES_PORT=${POSTGRES_PORT:-$DEFAULT_POSTGRES_PORT}
+
+# Firewall option
+echo ""
+echo "🔥 FIREWALL CONFIGURATION OPTION:"
+read -p "Configure and enable UFW firewall? (y/N): " CONFIGURE_UFW
+CONFIGURE_UFW=${CONFIGURE_UFW:-n}
 
 # Webmin installation option
 echo ""
@@ -163,7 +183,16 @@ echo "Network interface  : $NETWORK_INTERFACE"
 echo "Configured IP      : $CURRENT_IP"
 echo "Gateway            : $GATEWAY"
 echo "Domain             : $DOMAIN_LOCAL"
-echo "SSH Port           : $SSH_PORT"
+if [[ $CHANGE_SSH =~ ^[Yy]$ ]]; then
+    echo "SSH Configuration  : ENABLED (Port $SSH_PORT)"
+else
+    echo "SSH Configuration  : SKIPPED (Active Port: $SSH_PORT)"
+fi
+if [[ $CONFIGURE_UFW =~ ^[Yy]$ ]]; then
+    echo "UFW Firewall       : ENABLED"
+else
+    echo "UFW Firewall       : SKIPPED"
+fi
 if [[ $INSTALL_WEBMIN =~ ^[Yy]$ ]]; then
     echo "Webmin Port        : $WEBMIN_PORT"
 else
@@ -309,29 +338,30 @@ log " System tools and Python dependencies installed successfully"
 # STEP 2: CONFIGURE SSH AND USER ACCOUNTS
 #################################################################################
 
-log "STEP 2/6: Configuring SSH and Administrator Accounts"
+if [[ $CHANGE_SSH =~ ^[Yy]$ ]]; then
+    log "STEP 2/6: Configuring SSH and Administrator Accounts"
 
-# Verify/Create SSH admin user
-log "Checking administrator user: $ADMIN_USER..."
-if id "$ADMIN_USER" &>/dev/null; then
-    log " User $ADMIN_USER already exists — no creation needed."
-else
-    log "  User $ADMIN_USER not found. Creating..."
-    useradd -m -s /bin/bash -G sudo "$ADMIN_USER"
-    echo "$ADMIN_USER:$DEFAULT_PASSWORD" | chpasswd
-    log " User $ADMIN_USER created (temporary password: $DEFAULT_PASSWORD)"
-    log "  Remember to change this password on first login!"
-fi
+    # Verify/Create SSH admin user
+    log "Checking administrator user: $ADMIN_USER..."
+    if id "$ADMIN_USER" &>/dev/null; then
+        log " User $ADMIN_USER already exists — no creation needed."
+    else
+        log "  User $ADMIN_USER not found. Creating..."
+        useradd -m -s /bin/bash -G sudo "$ADMIN_USER"
+        echo "$ADMIN_USER:$DEFAULT_PASSWORD" | chpasswd
+        log " User $ADMIN_USER created (temporary password: $DEFAULT_PASSWORD)"
+        log "  Remember to change this password on first login!"
+    fi
 
-# Secure SSH configuration (keep passwords for now)
-log "Configuring secure SSH on port $SSH_PORT..."
+    # Secure SSH configuration (keep passwords for now)
+    log "Configuring secure SSH on port $SSH_PORT..."
 
-# Keep backup of original sshd_config if it doesn't already exist
-if [ ! -f /etc/ssh/sshd_config.backup ]; then
-    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-fi
+    # Keep backup of original sshd_config if it doesn't already exist
+    if [ ! -f /etc/ssh/sshd_config.backup ]; then
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+    fi
 
-cat > /etc/ssh/sshd_config << EOF
+    cat > /etc/ssh/sshd_config << EOF
 # Secure SSH configuration
 Port $SSH_PORT
 PermitRootLogin no
@@ -361,37 +391,41 @@ AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 
-# Test SSH config syntax
-if sshd -t; then
-    log "SSH config syntax valid"
-    
-    # Restart and verify
-    if systemctl restart ssh; then
-        sleep 3
-        if ss -tlnp | grep ":$SSH_PORT" | grep sshd >/dev/null; then
-            log "SSH listening on port $SSH_PORT"
-            SSH_VERIFIED=true
+    # Test SSH config syntax
+    if sshd -t; then
+        log "SSH config syntax valid"
+        
+        # Restart and verify
+        if systemctl restart ssh; then
+            sleep 3
+            if ss -tlnp | grep ":$SSH_PORT" | grep sshd >/dev/null; then
+                log "SSH listening on port $SSH_PORT"
+                SSH_VERIFIED=true
+            else
+                warning "SSH failed to start listening on port $SSH_PORT"
+                SSH_VERIFIED=false
+            fi
         else
-            warning "SSH failed to start listening on port $SSH_PORT"
+            warning "SSH service failed to restart with new configuration"
             SSH_VERIFIED=false
         fi
     else
-        warning "SSH service failed to restart with new configuration"
+        warning "SSH configuration syntax invalid"
         SSH_VERIFIED=false
     fi
-else
-    warning "SSH configuration syntax invalid"
-    SSH_VERIFIED=false
-fi
 
-if [ "$SSH_VERIFIED" = false ]; then
-    warning "Reverting to backup SSH configuration to avoid lockout..."
-    cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-    if systemctl restart ssh; then
-        log "Successfully reverted to backup SSH configuration."
-    else
-        error "Critical: Failed to restore backup SSH configuration!"
+    if [ "$SSH_VERIFIED" = false ]; then
+        warning "Reverting to backup SSH configuration to avoid lockout..."
+        cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+        if systemctl restart ssh; then
+            log "Successfully reverted to backup SSH configuration."
+        else
+            error "Critical: Failed to restore backup SSH configuration!"
+        fi
     fi
+else
+    log "STEP 2/6: Configuring SSH and Administrator Accounts [SKIPPED]"
+    SSH_VERIFIED=false
 fi
 
 #################################################################################
@@ -406,42 +440,47 @@ LOCAL_NETWORK=$(echo $CURRENT_IP | awk -F'.' '{print $1"."$2"."$3".0/24"}')
 log "Detected local network: $LOCAL_NETWORK (restricting internal access)"
 
 # UFW configuration
-log "Configuring UFW firewall..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
+if [[ $CONFIGURE_UFW =~ ^[Yy]$ ]]; then
+    log "Configuring UFW firewall..."
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
 
-# Opening custom ports
-if [ "$SSH_VERIFIED" = true ]; then
-    log "Opening SSH port: $SSH_PORT"
-    ufw allow $SSH_PORT/tcp comment 'SSH Custom'
+    # Opening custom ports
+    if [ "$SSH_VERIFIED" = true ]; then
+        log "Opening SSH port: $SSH_PORT"
+        ufw allow $SSH_PORT/tcp comment 'SSH Custom'
+    else
+        # Fallback to detected SSH port or backup SSH port
+        BACKUP_SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config.backup 2>/dev/null | awk '{print $2}')
+        BACKUP_SSH_PORT=${BACKUP_SSH_PORT:-$DETECTED_SSH_PORT}
+        log "Opening backup SSH port: $BACKUP_SSH_PORT"
+        ufw allow $BACKUP_SSH_PORT/tcp comment 'SSH Backup Port'
+    fi
+
+    log "Opening HTTP/HTTPS ports"
+    ufw allow 80/tcp comment 'HTTP'
+    ufw allow 443/tcp comment 'HTTPS'
+
+    log "Opening Odoo port: $ODOO_PORT (local network only)"
+    ufw allow from $LOCAL_NETWORK to any port $ODOO_PORT comment 'Odoo Local Network Only'
+
+    if [[ $INSTALL_WEBMIN =~ ^[Yy]$ ]]; then
+        log "Opening Webmin port: $WEBMIN_PORT (local network only)"
+        ufw allow from $LOCAL_NETWORK to any port $WEBMIN_PORT comment 'Webmin Local Network Only'
+    fi
+
+    # Enable firewall
+    ufw --force enable || error "Firewall activation failed"
+
+    # Verification of applied rules
+    log " Checking UFW restriction rules..."
+    ufw status numbered | grep -E "($ODOO_PORT|$WEBMIN_PORT)" || true
+
+    log " Firewall configured successfully"
 else
-    BACKUP_SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config.backup | awk '{print $2}')
-    BACKUP_SSH_PORT=${BACKUP_SSH_PORT:-22}
-    log "Opening backup SSH port: $BACKUP_SSH_PORT"
-    ufw allow $BACKUP_SSH_PORT/tcp comment 'SSH Backup Port'
+    log " UFW firewall configuration [SKIPPED]"
 fi
-
-log "Opening HTTP/HTTPS ports"
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
-
-log "Opening Odoo port: $ODOO_PORT (local network only)"
-ufw allow from $LOCAL_NETWORK to any port $ODOO_PORT comment 'Odoo Local Network Only'
-
-if [[ $INSTALL_WEBMIN =~ ^[Yy]$ ]]; then
-    log "Opening Webmin port: $WEBMIN_PORT (local network only)"
-    ufw allow from $LOCAL_NETWORK to any port $WEBMIN_PORT comment 'Webmin Local Network Only'
-fi
-
-# Enable firewall
-ufw --force enable || error "Firewall activation failed"
-
-# Verification of applied rules
-log " Checking UFW restriction rules..."
-ufw status numbered | grep -E "($ODOO_PORT|$WEBMIN_PORT)" || true
-
-log " Firewall configured successfully"
 
 # Static IP configuration
 log "Configuring static IP..."
@@ -938,8 +977,9 @@ log " Nginx, Odoo $ODOO_VERSION and Webmin (optional) installed and configured"
 log "STEP 6/6: Final system security hardening"
 
 # Fail2ban configuration
-log "Configuring Fail2ban..."
-cat > /etc/fail2ban/jail.local << EOF
+if [[ $CHANGE_SSH =~ ^[Yy]$ ]] || [[ $CONFIGURE_UFW =~ ^[Yy]$ ]]; then
+    log "Configuring Fail2ban..."
+    cat > /etc/fail2ban/jail.local << EOF
 [sshd]
 enabled = true
 port = $SSH_PORT
@@ -949,15 +989,18 @@ bantime = 3600
 findtime = 600
 EOF
 
-# Enable traditional logs
-systemctl enable rsyslog
-systemctl start rsyslog
-touch /var/log/auth.log
-chown syslog:adm /var/log/auth.log
-chmod 640 /var/log/auth.log
+    # Enable traditional logs
+    systemctl enable rsyslog
+    systemctl start rsyslog
+    touch /var/log/auth.log
+    chown syslog:adm /var/log/auth.log
+    chmod 640 /var/log/auth.log
 
-systemctl enable fail2ban
-systemctl restart fail2ban || error "Fail2ban startup failed"
+    systemctl enable fail2ban
+    systemctl restart fail2ban || error "Fail2ban startup failed"
+else
+    log " Fail2ban configuration [SKIPPED]"
+fi
 
 # Automatic backup configuration
 log "Configuring automatic backup..."
