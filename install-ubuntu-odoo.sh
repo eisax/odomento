@@ -216,7 +216,7 @@ EOF
 #################################################################################
 
 log "Starting automated installation..."
-log "STEP 1/5: System update and tool installation (non-interactive mode)"
+log "STEP 1/6: System update and tool installation (non-interactive mode)"
 
 # System update in automatic mode
 log "Updating system..."
@@ -306,10 +306,99 @@ fi
 log " System tools and Python dependencies installed successfully"
 
 #################################################################################
-# STEP 2: COMPLETE FIREWALL CONFIGURATION
+# STEP 2: CONFIGURE SSH AND USER ACCOUNTS
 #################################################################################
 
-log "STEP 2/5: Firewall configuration with all custom ports"
+log "STEP 2/6: Configuring SSH and Administrator Accounts"
+
+# Verify/Create SSH admin user
+log "Checking administrator user: $ADMIN_USER..."
+if id "$ADMIN_USER" &>/dev/null; then
+    log " User $ADMIN_USER already exists — no creation needed."
+else
+    log "  User $ADMIN_USER not found. Creating..."
+    useradd -m -s /bin/bash -G sudo "$ADMIN_USER"
+    echo "$ADMIN_USER:$DEFAULT_PASSWORD" | chpasswd
+    log " User $ADMIN_USER created (temporary password: $DEFAULT_PASSWORD)"
+    log "  Remember to change this password on first login!"
+fi
+
+# Secure SSH configuration (keep passwords for now)
+log "Configuring secure SSH on port $SSH_PORT..."
+
+# Keep backup of original sshd_config if it doesn't already exist
+if [ ! -f /etc/ssh/sshd_config.backup ]; then
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+fi
+
+cat > /etc/ssh/sshd_config << EOF
+# Secure SSH configuration
+Port $SSH_PORT
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+MaxAuthTries 3
+AllowUsers $ADMIN_USER
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Secure protocols
+Protocol 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# Authentication
+LoginGraceTime 60
+StrictModes yes
+RSAAuthentication yes
+
+# Additional security
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+
+# Test SSH config syntax
+if sshd -t; then
+    log "SSH config syntax valid"
+    
+    # Restart and verify
+    if systemctl restart ssh; then
+        sleep 3
+        if ss -tlnp | grep ":$SSH_PORT" | grep sshd >/dev/null; then
+            log "SSH listening on port $SSH_PORT"
+            SSH_VERIFIED=true
+        else
+            warning "SSH failed to start listening on port $SSH_PORT"
+            SSH_VERIFIED=false
+        fi
+    else
+        warning "SSH service failed to restart with new configuration"
+        SSH_VERIFIED=false
+    fi
+else
+    warning "SSH configuration syntax invalid"
+    SSH_VERIFIED=false
+fi
+
+if [ "$SSH_VERIFIED" = false ]; then
+    warning "Reverting to backup SSH configuration to avoid lockout..."
+    cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+    if systemctl restart ssh; then
+        log "Successfully reverted to backup SSH configuration."
+    else
+        error "Critical: Failed to restore backup SSH configuration!"
+    fi
+fi
+
+#################################################################################
+# STEP 3: FIREWALL AND NETWORK CONFIGURATION
+#################################################################################
+
+log "STEP 3/6: Firewall and network configuration"
 
 # Local network detection (used to restrict Odoo, PostgreSQL and Webmin)
 # We derive /24 from $CURRENT_IP already validated by the user
@@ -323,8 +412,15 @@ ufw default deny incoming
 ufw default allow outgoing
 
 # Opening custom ports
-log "Opening SSH port: $SSH_PORT"
-ufw allow $SSH_PORT/tcp comment 'SSH Custom'
+if [ "$SSH_VERIFIED" = true ]; then
+    log "Opening SSH port: $SSH_PORT"
+    ufw allow $SSH_PORT/tcp comment 'SSH Custom'
+else
+    BACKUP_SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config.backup | awk '{print $2}')
+    BACKUP_SSH_PORT=${BACKUP_SSH_PORT:-22}
+    log "Opening backup SSH port: $BACKUP_SSH_PORT"
+    ufw allow $BACKUP_SSH_PORT/tcp comment 'SSH Backup Port'
+fi
 
 log "Opening HTTP/HTTPS ports"
 ufw allow 80/tcp comment 'HTTP'
@@ -332,9 +428,6 @@ ufw allow 443/tcp comment 'HTTPS'
 
 log "Opening Odoo port: $ODOO_PORT (local network only)"
 ufw allow from $LOCAL_NETWORK to any port $ODOO_PORT comment 'Odoo Local Network Only'
-
-log "Opening PostgreSQL port: $POSTGRES_PORT (localhost only)"
-ufw allow from 127.0.0.1 to any port $POSTGRES_PORT comment 'PostgreSQL Localhost Only'
 
 if [[ $INSTALL_WEBMIN =~ ^[Yy]$ ]]; then
     log "Opening Webmin port: $WEBMIN_PORT (local network only)"
@@ -346,13 +439,18 @@ ufw --force enable || error "Firewall activation failed"
 
 # Verification of applied rules
 log " Checking UFW restriction rules..."
-ufw status numbered | grep -E "($ODOO_PORT|$POSTGRES_PORT|$WEBMIN_PORT)" || true
+ufw status numbered | grep -E "($ODOO_PORT|$WEBMIN_PORT)" || true
 
 log " Firewall configured successfully"
 
 # Static IP configuration
 log "Configuring static IP..."
-cat > /etc/netplan/00-installer-config.yaml << EOF
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+if [ -f "$NETPLAN_FILE" ]; then
+    cp "$NETPLAN_FILE" "${NETPLAN_FILE}.backup"
+fi
+
+cat > "$NETPLAN_FILE" << EOF
 network:
   version: 2
   ethernets:
@@ -367,7 +465,24 @@ network:
         addresses: [8.8.8.8, 8.8.4.4, $GATEWAY]
 EOF
 
-netplan apply || warning "Network configuration failed (continuing...)"
+if netplan generate; then
+    log "Netplan configuration syntax valid. Applying network configuration..."
+    if netplan apply; then
+        log "Network configuration applied successfully."
+    else
+        warning "Netplan apply failed. Reverting to backup network configuration..."
+        if [ -f "${NETPLAN_FILE}.backup" ]; then
+            cp "${NETPLAN_FILE}.backup" "$NETPLAN_FILE"
+            netplan apply || error "Failed to restore backup network configuration!"
+        fi
+    fi
+else
+    warning "Netplan configuration syntax invalid. Reverting network configuration..."
+    if [ -f "${NETPLAN_FILE}.backup" ]; then
+        cp "${NETPLAN_FILE}.backup" "$NETPLAN_FILE"
+        netplan generate
+    fi
+fi
 
 # Local domain configuration
 log "Configuring domain: $DOMAIN_LOCAL"
@@ -387,10 +502,10 @@ grep -qF "127.0.0.1 $DOMAIN_LOCAL" /etc/hosts || echo "127.0.0.1 $DOMAIN_LOCAL" 
 log " Network configuration completed"
 
 #################################################################################
-# STEP 3: POSTGRESQL INSTALLATION
+# STEP 4: POSTGRESQL INSTALLATION
 #################################################################################
 
-log "STEP 3/5: PostgreSQL installation and configuration"
+log "STEP 4/6: PostgreSQL installation and configuration"
 
 # PostgreSQL installation
 log "Installing PostgreSQL..."
@@ -443,10 +558,10 @@ fi
 log " PostgreSQL configured on port $POSTGRES_PORT"
 
 #################################################################################
-# STEP 4: NGINX + ODOO + WEBMIN (OPTIONAL) INSTALLATION
+# STEP 5: NGINX + ODOO + WEBMIN (OPTIONAL) INSTALLATION
 #################################################################################
 
-log "STEP 4/5: Installing Nginx, Odoo $ODOO_VERSION and Webmin (optional)"
+log "STEP 5/6: Installing Nginx, Odoo $ODOO_VERSION and Webmin (optional)"
 
 # Nginx installation
 log "Installing Nginx..."
@@ -817,58 +932,10 @@ fi
 log " Nginx, Odoo $ODOO_VERSION and Webmin (optional) installed and configured"
 
 #################################################################################
-# STEP 5: FINAL SECURITY + AUTOMATIC PASSWORD DISABLE
+# STEP 6: FINAL SECURITY HARDENING
 #################################################################################
 
-log "STEP 5/5: Final system security hardening"
-
-# Verify/Create SSH admin user
-log "Checking administrator user: $ADMIN_USER..."
-if id "$ADMIN_USER" &>/dev/null; then
-    log " User $ADMIN_USER already exists — no creation needed."
-else
-    log "  User $ADMIN_USER not found. Creating..."
-    useradd -m -s /bin/bash -G sudo "$ADMIN_USER"
-    echo "$ADMIN_USER:$DEFAULT_PASSWORD" | chpasswd
-    log " User $ADMIN_USER created (temporary password: $DEFAULT_PASSWORD)"
-    log "  Remember to change this password on first login!"
-fi
-
-# Secure SSH configuration (keep passwords for now)
-log "Configuring secure SSH on port $SSH_PORT..."
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-
-cat > /etc/ssh/sshd_config << EOF
-# Secure SSH configuration
-Port $SSH_PORT
-PermitRootLogin no
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
-PasswordAuthentication yes
-MaxAuthTries 3
-AllowUsers $ADMIN_USER
-ClientAliveInterval 300
-ClientAliveCountMax 2
-
-# Secure protocols
-Protocol 2
-HostKey /etc/ssh/ssh_host_rsa_key
-HostKey /etc/ssh/ssh_host_ecdsa_key
-HostKey /etc/ssh/ssh_host_ed25519_key
-
-# Authentication
-LoginGraceTime 60
-StrictModes yes
-RSAAuthentication yes
-
-# Additional security
-X11Forwarding no
-PrintMotd no
-AcceptEnv LANG LC_*
-Subsystem sftp /usr/lib/openssh/sftp-server
-EOF
-
-systemctl restart ssh || error "SSH restart failed"
+log "STEP 6/6: Final system security hardening"
 
 # Fail2ban configuration
 log "Configuring Fail2ban..."
